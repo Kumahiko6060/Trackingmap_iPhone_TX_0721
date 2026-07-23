@@ -230,24 +230,55 @@ function onCoordNotify(event) {
   notifyCounter++;
   if (notifyCounter % sendEveryN !== 0) return;
 
-  sendToFirebase(lat, lng, speedKmph, deviceTimeMs);
+  queueForSend(lat, lng, speedKmph);
 }
 
 // ==========================================
 // Firebaseへの送信(モバイル通信・fetch経由)
+//
+// 【重要】以前は BLE Notify のたびに sendToFirebase() を await せず毎回
+// 新規に呼んでいたため、モバイル回線が一瞬でも遅くなると(電波が弱い場所、
+// トンネル際など)、複数のfetchリクエストが同時に飛んだ状態になり、
+// それらがバラバラの順番でFirebaseに届く(＝レースコンディション)ことが
+// あった。受信側の地図では、これが「まとまって届く→しばらく途切れる」
+// という不規則なバーストとして見え、地図側でどれだけ補間しても直せない
+// 種類のカクつき・ジャンプの原因になっていた。
+//
+// 対策として、常に「今わかっている最新の1点だけ」を送るキュー方式にする。
+// - 送信中(sendInFlight=true)に次のBLE Notifyが来ても、新しいリクエストは
+//   発行せず、pendingPayloadを最新の値で上書きするだけにする
+// - 送信が完了したら、そのとき待っている最新の位置だけを続けて送る
+// これにより通信は常に1本ずつ・順序通りに送られ、回線が一時的に遅くても
+// リクエストが積み上がったり順番が入れ替わったりしなくなる。
 // ==========================================
-async function sendToFirebase(lat, lng, speedKmph, deviceTimeMs) {
-  const url = `${FIREBASE_BASE_URL}${currentCircuitName}/live/${CAR_ID}.json`;
+let sendInFlight = false;
+let pendingPayload = null;
+
+function queueForSend(lat, lng, speedKmph) {
   // 【重要】Firebase側のルールで live/$car_id 配下は
   // lat / lng / speed / time 以外のキーを許可していない($other: validate false)。
   // 以前ここに device_time を混ぜていたためルール違反で401(Permission Denied)になっていた。
   // M5Stick側で取得した時刻(deviceTimeMs)はログ表示にのみ使い、Firebaseには送らない。
-  const payload = {
+  pendingPayload = {
     lat: lat,
     lng: lng,
     speed: speedKmph,
     time: Date.now()          // 送信元(iPhone)側の時刻
   };
+
+  if (!sendInFlight) {
+    flushPending();
+  }
+}
+
+async function flushPending() {
+  if (!pendingPayload) return;
+  const payload = pendingPayload;
+  pendingPayload = null;
+  sendInFlight = true;
+
+  const startPerf = performance.now();
+  const url = `${FIREBASE_BASE_URL}${currentCircuitName}/live/${CAR_ID}.json`;
 
   try {
     const res = await fetch(url, {
@@ -256,8 +287,9 @@ async function sendToFirebase(lat, lng, speedKmph, deviceTimeMs) {
       body: JSON.stringify(payload)
     });
 
+    const rttMs = Math.round(performance.now() - startPerf);
     if (res.ok) {
-      setFbStatus("送信OK", true);
+      setFbStatus(`送信OK (${rttMs}ms)`, true);
     } else {
       setFbStatus(`失敗 (${res.status})`, false);
       log(`Firebase送信失敗: status=${res.status}`);
@@ -265,6 +297,12 @@ async function sendToFirebase(lat, lng, speedKmph, deviceTimeMs) {
   } catch (err) {
     setFbStatus("送信エラー", false);
     log("Firebase送信エラー: " + err);
+  } finally {
+    sendInFlight = false;
+    // 送信中に新しい位置が来ていれば、続けてそれを送る(常に1本ずつ)
+    if (pendingPayload) {
+      flushPending();
+    }
   }
 }
 
